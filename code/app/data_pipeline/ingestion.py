@@ -1,65 +1,94 @@
-"""Unit tests for DataCleaner."""
+"""Market data ingestion service for real-time and historical prices."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 from app.data_pipeline.cleaning import DataCleaner
 
 
-def test_handle_missing_drops_invalid_records() -> None:
-    cleaner = DataCleaner()
-    records = [
-        {
-            "timestamp": "2024-01-01T00:00:00+00:00",
-            "ticker": "AAPL",
-            "open": 1,
-            "high": 2,
-            "low": 1,
-            "close": 1.5,
-            "volume": 10,
-        },
-        {
-            "timestamp": "2024-01-01T00:01:00+00:00",
-            "ticker": "AAPL",
-            "open": None,
-            "high": 2,
-            "low": 1,
-            "close": 1.5,
-            "volume": 10,
-        },
-    ]
+@dataclass(slots=True)
+class PricePoint:
+    """Canonical market data record."""
 
-    cleaned = cleaner.handle_missing(records)
-
-    assert len(cleaned) == 1
+    timestamp: str
+    ticker: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
-def test_outlier_filter_removes_large_intrabar_moves() -> None:
-    cleaner = DataCleaner()
-    records = [
-        {"timestamp": "t", "ticker": "AAPL", "open": 1, "high": 1.2, "low": 1.0, "close": 1.1, "volume": 10},
-        {"timestamp": "t", "ticker": "AAPL", "open": 1, "high": 2.0, "low": 1.0, "close": 1.1, "volume": 10},
-    ]
+class MarketDataProvider(Protocol):
+    """External market data provider contract."""
 
-    filtered = cleaner.outlier_filter(records, max_intrabar_move=0.25)
+    def fetch_realtime(self, ticker: str) -> list[dict]:
+        """Return recent real-time bars for a ticker."""
 
-    assert len(filtered) == 1
-    assert filtered[0]["high"] == 1.2
+    def fetch_historical(self, ticker: str, start: datetime, end: datetime) -> list[dict]:
+        """Return historical bars for a ticker and time range."""
 
 
-def test_validate_schema_normalizes_fields() -> None:
-    cleaner = DataCleaner()
+class TimeSeriesStore(Protocol):
+    """Time-series persistence contract."""
 
-    normalized = cleaner.validate_schema(
-        [
-            {
-                "timestamp": "2024-01-01T00:00:00+00:00",
-                "ticker": "aapl",
-                "open": "100",
-                "high": "101",
-                "low": "99",
-                "close": "100.5",
-                "volume": "200",
-            }
+    def write_prices(self, ticker: str, records: list[PricePoint]) -> None:
+        """Persist price records."""
+
+    def read_prices(self, ticker: str, start: datetime, end: datetime) -> list[PricePoint]:
+        """Read price records for a ticker and time range."""
+
+
+class InMemoryTimeSeriesStore:
+    """Simple in-memory time-series store for local/dev and tests."""
+
+    def __init__(self) -> None:
+        self._data: dict[str, list[PricePoint]] = {}
+
+    def write_prices(self, ticker: str, records: list[PricePoint]) -> None:
+        self._data.setdefault(ticker.upper(), []).extend(records)
+
+    def read_prices(self, ticker: str, start: datetime, end: datetime) -> list[PricePoint]:
+        start_s = start.astimezone(timezone.utc).isoformat()
+        end_s = end.astimezone(timezone.utc).isoformat()
+        return [
+            point
+            for point in self._data.get(ticker.upper(), [])
+            if start_s <= point.timestamp <= end_s
         ]
-    )
 
-    assert normalized[0]["ticker"] == "AAPL"
-    assert normalized[0]["close"] == 100.5
+
+class MarketDataIngestor:
+    """Coordinates ingestion, cleaning, validation, and persistence."""
+
+    def __init__(self, provider: MarketDataProvider, store: TimeSeriesStore, cleaner: DataCleaner | None = None) -> None:
+        self.provider = provider
+        self.store = store
+        self.cleaner = cleaner or DataCleaner()
+
+    def fetch_realtime(self, ticker: str) -> list[PricePoint]:
+        """Ingest real-time market bars for a ticker."""
+        raw = self.provider.fetch_realtime(ticker)
+        return self._clean_and_store(ticker, raw)
+
+    def fetch_historical(self, ticker: str, hours: int = 24) -> list[PricePoint]:
+        """Ingest historical market bars for a ticker over the previous ``hours``."""
+        end = datetime.now(tz=timezone.utc)
+        start = end - timedelta(hours=hours)
+        raw = self.provider.fetch_historical(ticker, start, end)
+        return self._clean_and_store(ticker, raw)
+
+    def get_prices(self, ticker: str, start: datetime, end: datetime) -> list[PricePoint]:
+        """Read persisted price records."""
+        return self.store.read_prices(ticker, start, end)
+
+    def _clean_and_store(self, ticker: str, raw_records: list[dict]) -> list[PricePoint]:
+        cleaned = self.cleaner.handle_missing(raw_records)
+        filtered = self.cleaner.outlier_filter(cleaned)
+        validated = self.cleaner.validate_schema(filtered)
+        records = [PricePoint(**record) for record in validated]
+        self.store.write_prices(ticker, records)
+        return records
